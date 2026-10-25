@@ -7,6 +7,7 @@
 
 use crate::ghostty::{split_setting, Ghostty};
 use anyhow::{Context, Result};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub enum Entry {
@@ -137,30 +138,46 @@ impl ConfigFile {
     /// skipped by Ghostty with no error anywhere, so writing one is
     /// indistinguishable from writing a setting that had no visible effect.
     pub fn save(&mut self, gh: Option<&Ghostty>) -> Result<()> {
-        let dir = self.path.parent().unwrap_or(Path::new("."));
+        let dir = self.path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
         std::fs::create_dir_all(dir)?;
-        let tmp = dir.join(format!(".{}.ghonfig-tmp", file_name(&self.path)));
-        std::fs::write(&tmp, self.text())?;
-
-        if let Some(gh) = gh {
-            if let Err(msg) = gh.validate(&tmp) {
-                let _ = std::fs::remove_file(&tmp);
-                anyhow::bail!("{msg}");
-            }
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos();
+        let tmp = dir.join(format!(".{}.{}.{nonce}.ghonfig-tmp", file_name(&self.path), std::process::id()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // The temporary file contains the same private data as the config.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
         }
-
-        if self.path.exists() {
-            let _ = std::fs::copy(&self.path, dir.join(format!("{}.bak", file_name(&self.path))));
-            // write-temp-then-rename creates a fresh inode carrying the umask's
-            // mode, so without this a 0600 config silently becomes 0644 on the
-            // first save. Carry the original mode across.
-            #[cfg(unix)]
-            if let Ok(meta) = std::fs::metadata(&self.path) {
-                let _ = std::fs::set_permissions(&tmp, meta.permissions());
+        let mut file = options.open(&tmp).context("creating temporary config")?;
+        let result = (|| -> Result<()> {
+            file.write_all(self.text().as_bytes())?;
+            if let Some(gh) = gh {
+                gh.validate(&tmp).map_err(anyhow::Error::msg)?;
             }
+            self.backup(&tmp)?;
+            std::fs::rename(&tmp, &self.path).context("replacing config")?;
+            Ok(())
+        })();
+        // Remove only the file we successfully created, on every failure path.
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
         }
-        std::fs::rename(&tmp, &self.path)?;
+        result?;
         self.dirty = false;
+        Ok(())
+    }
+
+    fn backup(&self, tmp: &Path) -> Result<()> {
+        let meta = match std::fs::metadata(&self.path) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e).context("reading config permissions"),
+        };
+        std::fs::set_permissions(tmp, meta.permissions()).context("preserving config permissions")?;
+        let backup = self.path.with_file_name(format!("{}.bak", file_name(&self.path)));
+        std::fs::copy(&self.path, backup).context("backing up config")?;
         Ok(())
     }
 }
@@ -219,7 +236,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn save_preserves_the_file_mode() {
+    fn save_preserves_file_mode_and_handles_backup_failure() {
         use std::os::unix::fs::PermissionsExt;
         let dir = std::env::temp_dir().join("ghonfig-mode-test");
         let _ = std::fs::create_dir_all(&dir);
@@ -231,9 +248,20 @@ mod tests {
         c.set("font-size", "12", false);
         c.save(None).unwrap();
 
+        assert!(!c.dirty);
+        assert_eq!(std::fs::read_to_string(dir.join("config.bak")).unwrap(), "theme = Nord\n");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "rename must not reset the mode to the umask default");
-        let _ = std::fs::remove_dir_all(&dir);
+        // A directory at the backup path forces copy to fail.
+        std::fs::remove_file(dir.join("config.bak")).unwrap();
+        std::fs::create_dir(dir.join("config.bak")).unwrap();
+        let saved = c.text();
+        c.set("font-size", "14", false);
+        assert!(c.save(None).is_err());
+        assert!(c.dirty, "failed saves must keep pending edits");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), saved);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "temporary file leaked");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

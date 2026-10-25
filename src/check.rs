@@ -65,7 +65,7 @@ pub fn run(gh: Option<&Ghostty>, schema: Option<&Schema>, cfg: &ConfigFile) -> V
 /// A font that is missing and a font that is shadowed present identically —
 /// configured value ≠ rendered value — but need opposite fixes.
 fn font_check(gh: &Ghostty, cfg: &ConfigFile, schema: Option<&Schema>) -> Check {
-    let repeatable = schema.map_or(true, |s| s.is_repeatable("font-family"));
+    let repeatable = schema.is_none_or(|s| s.is_repeatable("font-family"));
     let Some(want) = cfg.get("font-family", repeatable) else {
         return match gh.rendered_face() {
             Some(f) => ok(format!("font: none pinned, using Ghostty's default ({f})")),

@@ -16,12 +16,37 @@ use std::time::{Duration, SystemTime};
 /// upgraded, so a binary-mtime stamp alone would never expire. TTL backs it up.
 const CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// What a key will accept, as Ghostty itself reports it.
+///
+/// Nothing here is a list of key names — see `probe_kinds` for how the whole
+/// schema is classified in two calls to the binary.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Kind {
+    /// A closed set. Ghostty names the members when it rejects a value.
+    Enum(Vec<String>),
+    /// `#rrggbb` or one of the 537 names `+list-colors` knows.
+    Color,
+    /// Constrained but open — a number, a size, a path.
+    Scalar,
+    /// A compound value with its own grammar: `keybind`, `palette`, `adjust-*`.
+    Structured,
+    /// Anything at all: `font-family`, `theme`, `command`, `title`.
+    Text,
+}
+
 /// A single configuration key as Ghostty describes it.
 pub struct Setting {
     pub key: String,
     /// Ghostty's default. Repeated keys (`keybind`) carry one entry per default.
     pub defaults: Vec<String>,
     pub doc: String,
+    pub kind: Kind,
+}
+
+/// An installed family together with the styles `+list-fonts` reports beneath it.
+pub struct FontFamily {
+    pub name: String,
+    pub styles: Vec<String>,
 }
 
 impl Setting {
@@ -65,15 +90,8 @@ impl Schema {
             .is_some_and(|s| s.defaults.len() > 1 || s.doc.contains("can be repeated"))
     }
 
-    /// Values a key will accept, when that is a closed set.
-    pub fn choices(&self, key: &str) -> Option<Vec<String>> {
-        let s = self.get(key)?;
-        // Booleans never reach the enum probe: Ghostty reports them as an
-        // invalid value with no list, so read them off the default instead.
-        if s.defaults.len() == 1 && matches!(s.defaults[0].as_str(), "true" | "false") {
-            return Some(vec!["true".into(), "false".into()]);
-        }
-        None
+    pub fn kind(&self, key: &str) -> Kind {
+        self.get(key).map_or(Kind::Text, |s| s.kind.clone())
     }
 }
 
@@ -164,6 +182,7 @@ impl Ghostty {
                             key: k,
                             defaults: if v.is_empty() { vec![] } else { vec![v] },
                             doc: doc.join("\n").trim().to_string(),
+                            kind: Kind::Text,
                         });
                     }
                 }
@@ -172,7 +191,57 @@ impl Ghostty {
                 doc.clear();
             }
         }
+        self.probe_kinds(&mut out);
         Ok(out)
+    }
+
+    /// Classify every key in the schema, by asking Ghostty twice.
+    ///
+    /// `+validate-config` reports *every* offending line in one pass, so a
+    /// config that assigns a sentinel to all 200 keys costs ~90ms and comes back
+    /// with the valid-value list for all 48 enums at once — versus 200 process
+    /// spawns to probe them one at a time.
+    ///
+    /// Colours need the second pass. Ghostty rejects the sentinel for
+    /// `background` and for `font-size` identically ("invalid value"), with no
+    /// hint of the type; but `background` accepts `#123456` and `font-size` does
+    /// not. A key that is constrained AND takes a hex triple is a colour. That
+    /// derivation is why there is no list of colour keys in this file.
+    fn probe_kinds(&self, settings: &mut [Setting]) {
+        let keys: Vec<&str> = settings.iter().map(|s| s.key.as_str()).collect();
+        let mut kinds: HashMap<String, Kind> = HashMap::new();
+        for line in self.probe_all(&keys, "__ghonfig_probe__", "kinds").lines() {
+            if let Some((k, kind)) = classify(line) {
+                kinds.insert(k, kind);
+            }
+        }
+        // Keys ABSENT here took the hex triple.
+        let hex_rejected: std::collections::HashSet<String> = self
+            .probe_all(&keys, "#123456", "hex")
+            .lines()
+            .filter_map(|l| classify(l).map(|(k, _)| k))
+            .collect();
+
+        for s in settings.iter_mut() {
+            s.kind = match kinds.get(&s.key) {
+                None => Kind::Text,
+                Some(Kind::Scalar) if !hex_rejected.contains(&s.key) => Kind::Color,
+                Some(k) => k.clone(),
+            };
+        }
+    }
+
+    /// Assign `value` to every key at once and return what Ghostty complains about.
+    fn probe_all(&self, keys: &[&str], value: &str, tag: &str) -> String {
+        let path = std::env::temp_dir()
+            .join(format!("ghonfig-probe-{tag}-{}.conf", std::process::id()));
+        let body: String = keys.iter().map(|k| format!("{k} = {value}\n")).collect();
+        if std::fs::write(&path, body).is_err() {
+            return String::new();
+        }
+        let out = self.validate(&path).err().unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        out
     }
 
     /// `Name (resources)` / `Name (user)` — strip the source annotation.
@@ -189,23 +258,82 @@ impl Ghostty {
             .collect())
     }
 
-    /// Installed font *families*. `+list-fonts` indents style names beneath each
-    /// family; only the unindented lines are what `font-family` takes.
+    /// Installed font *families*, each with the styles it ships.
     ///
-    /// "JetBrains Mono" is prepended because Ghostty EMBEDS it: it renders
+    /// `+list-fonts` indents face names beneath each family; only the unindented
+    /// lines are what `font-family` takes, and the indented ones — which the
+    /// picker shows so you can see a family has no italic before choosing it —
+    /// are the family name plus a style suffix.
+    ///
+    /// "JetBrains Mono" is appended because Ghostty EMBEDS it: it renders
     /// perfectly but never appears in this list, so a membership test against
     /// `+list-fonts` rejects the one font most likely to be wanted.
-    pub fn fonts(&self) -> Result<Vec<String>> {
+    pub fn fonts(&self) -> Result<Vec<FontFamily>> {
         let text = self.cached("fonts", &["+list-fonts"])?;
-        let mut fams: Vec<String> = text
-            .lines()
-            .filter(|l| !l.is_empty() && !l.starts_with(char::is_whitespace))
-            .map(|l| l.trim_end().to_string())
-            .collect();
-        fams.push("JetBrains Mono".to_string());
-        fams.sort_unstable();
-        fams.dedup();
+        let mut fams: Vec<FontFamily> = Vec::new();
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            if !line.starts_with(char::is_whitespace) {
+                fams.push(FontFamily { name: line.trim_end().to_string(), styles: vec![] });
+                continue;
+            }
+            let Some(f) = fams.last_mut() else { continue };
+            let style = style_of(&f.name, line.trim());
+            if !f.styles.contains(&style) {
+                f.styles.push(style);
+            }
+        }
+        fams.push(FontFamily {
+            name: "JetBrains Mono".to_string(),
+            styles: vec!["ships with Ghostty".into()],
+        });
+        fams.sort_by(|a, b| a.name.cmp(&b.name));
+        fams.dedup_by(|a, b| a.name == b.name);
         Ok(fams)
+    }
+
+    /// The colour names Ghostty accepts wherever a colour is valid.
+    ///
+    /// `+list-colors` prints each one twice ("alice blue" and "AliceBlue"); the
+    /// spaced spelling is dropped so the picker is not half duplicates.
+    pub fn colors(&self) -> Result<Vec<(String, String)>> {
+        let text = self.cached("colors", &["+list-colors"])?;
+        Ok(text
+            .lines()
+            .filter_map(split_setting)
+            .filter(|(name, _)| !name.contains(' '))
+            .collect())
+    }
+
+    /// Every action a `keybind` can trigger.
+    pub fn actions(&self) -> Result<Vec<String>> {
+        let text = self.cached("actions", &["+list-actions"])?;
+        Ok(text.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+    }
+
+    /// A theme's own `key = value` lines, so its palette can be shown before it
+    /// is applied. Themes are ordinary Ghostty config files.
+    pub fn theme_colors(&self, name: &str) -> Option<Vec<(String, String)>> {
+        let mut dirs = vec![home().join(".config/ghostty/themes")];
+        if let Some(r) = self.resources_dir() {
+            dirs.push(r.join("themes"));
+        }
+        let text = dirs.iter().find_map(|d| std::fs::read_to_string(d.join(name)).ok())?;
+        Some(text.lines().filter_map(split_setting).collect())
+    }
+
+    /// `Ghostty.app/Contents/Resources/ghostty` on macOS, `<prefix>/share/ghostty`
+    /// elsewhere — derived from where the binary actually is, not assumed.
+    fn resources_dir(&self) -> Option<PathBuf> {
+        if let Some(d) = std::env::var_os("GHOSTTY_RESOURCES_DIR") {
+            return Some(PathBuf::from(d));
+        }
+        let up = self.bin.parent()?.parent()?;
+        [up.join("Resources/ghostty"), up.join("share/ghostty")]
+            .into_iter()
+            .find(|p| p.is_dir())
     }
 
     /// Ghostty does not fail loudly on a bad setting: it skips the line, keeps
@@ -224,26 +352,6 @@ impl Ghostty {
         } else {
             Err(msg)
         }
-    }
-
-    /// Ask Ghostty for a key's valid values by handing it an invalid one.
-    ///
-    /// The error names them: `cursor-style: invalid value "x", valid values
-    /// are: bar, block, underline, block_hollow`. Free-form keys accept the
-    /// sentinel and answer nothing, which is the correct answer for them.
-    pub fn valid_values(&self, key: &str) -> Option<Vec<String>> {
-        let probe = std::env::temp_dir().join("ghonfig-probe.conf");
-        std::fs::write(&probe, format!("{key} = __ghonfig_probe__\n")).ok()?;
-        let err = self.validate(&probe).err()?;
-        let _ = std::fs::remove_file(&probe);
-        let (_, list) = err.split_once("valid values are:")?;
-        let list = list.split(['\n', '\r']).next()?;
-        Some(
-            list.split(',')
-                .map(|s| s.trim().trim_end_matches('.').to_string())
-                .filter(|s| !s.is_empty())
-                .collect(),
-        )
     }
 
     /// The face Ghostty actually renders with, under the live config.
@@ -304,6 +412,67 @@ fn parse_face(out: &str) -> Option<String> {
     let face = face.trim().trim_end_matches('.');
     let face = face.trim_matches(|c| c == '"' || c == '\u{201c}' || c == '\u{201d}');
     (!face.is_empty()).then(|| face.to_string())
+}
+
+/// The style a face adds to its family: `Bold Italic` out of
+/// `BlexMono Nerd Font Mono Bold Italic`.
+///
+/// A plain prefix strip is not enough. Half the Nerd Font packages name the
+/// family in full and the faces by initials — family `MonaspiceNe Nerd Font
+/// Mono`, face `MonaspiceNe NFM Bold` — so after dropping the tokens the two
+/// share, one leading all-caps token is dropped as the abbreviation of the rest
+/// of the family name. That is a shape rule, not a list of known style names,
+/// which would be one more thing to keep in step with what people install.
+fn style_of(family: &str, face: &str) -> String {
+    let fam: Vec<&str> = family.split_whitespace().collect();
+    let all: Vec<&str> = face.split_whitespace().collect();
+    let shared = all.iter().zip(&fam).take_while(|(a, f)| a == f).count();
+    let mut rest = &all[shared..];
+    if rest
+        .first()
+        .is_some_and(|t| t.len() > 1 && t.chars().all(|c| c.is_ascii_uppercase()))
+    {
+        rest = &rest[1..];
+    }
+    match rest.join(" ") {
+        s if s.is_empty() => "Regular".to_string(),
+        s => s,
+    }
+}
+
+/// One complaint from `+validate-config`, read back as a type.
+///
+/// `/path/config:57:cursor-style: invalid value "x", valid values are: bar, block`
+/// `/path/config:23:adjust-cell-width: unknown error error.InvalidFormat`
+///
+/// The path may itself contain colons, so the key is taken from the *last*
+/// colon-separated field before the message rather than by counting fields.
+fn classify(line: &str) -> Option<(String, Kind)> {
+    let (head, rest, structured) = match line.split_once(": invalid value ") {
+        Some((h, r)) => (h, r, false),
+        None => (line.split_once(": unknown error ")?.0, "", true),
+    };
+    let key = head.rsplit(':').next()?.trim();
+    if key.is_empty() || key.contains(char::is_whitespace) {
+        return None;
+    }
+    if structured {
+        return Some((key.to_string(), Kind::Structured));
+    }
+    let values: Vec<String> = rest
+        .split_once("valid values are:")
+        .and_then(|(_, list)| list.split(['\n', '\r']).next())
+        .map(|list| {
+            list.split(',')
+                .map(|s| s.trim().trim_end_matches('.').to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(match values.is_empty() {
+        true => (key.to_string(), Kind::Scalar),
+        false => (key.to_string(), Kind::Enum(values)),
+    })
 }
 
 /// `key = value`, ignoring comments and blanks. Empty values are meaningful
@@ -378,6 +547,40 @@ mod tests {
         let out = "U+41 « A » found in face \u{201c}MonaspiceNe Nerd Font Mono\u{201d}.";
         assert_eq!(parse_face(out).as_deref(), Some("MonaspiceNe Nerd Font Mono"));
         assert_eq!(parse_face("nonsense"), None);
+    }
+
+    #[test]
+    fn style_is_what_the_face_adds_to_the_family() {
+        assert_eq!(style_of("BlexMono Nerd Font Mono", "BlexMono Nerd Font Mono Bold Italic"), "Bold Italic");
+        // The shape that a plain prefix strip leaves as "NFM Bold".
+        assert_eq!(style_of("MonaspiceNe Nerd Font Mono", "MonaspiceNe NFM Bold"), "Bold");
+        assert_eq!(style_of("Andale Mono", "Andale Mono"), "Regular");
+    }
+
+    #[test]
+    fn classifies_a_validation_complaint() {
+        let enum_line = "/private/tmp/x.conf:57:cursor-style: invalid value \"p\", valid values are: bar, block, underline, block_hollow";
+        assert_eq!(
+            classify(enum_line),
+            Some((
+                "cursor-style".into(),
+                Kind::Enum(vec!["bar".into(), "block".into(), "underline".into(), "block_hollow".into()])
+            ))
+        );
+        // A bool-looking default that is NOT a bool: the old shortcut of reading
+        // choices off `defaults` offered true/false and hid the other two.
+        let four = "/x:63:mouse-shift-capture: invalid value \"p\", valid values are: false, true, always, never";
+        assert!(matches!(classify(four), Some((_, Kind::Enum(v))) if v.len() == 4));
+
+        assert_eq!(
+            classify("/x:12:font-size: invalid value \"p\""),
+            Some(("font-size".into(), Kind::Scalar))
+        );
+        assert_eq!(
+            classify("/x:23:adjust-cell-width: unknown error error.InvalidFormat"),
+            Some(("adjust-cell-width".into(), Kind::Structured))
+        );
+        assert_eq!(classify("some unrelated stderr noise"), None);
     }
 
     #[test]

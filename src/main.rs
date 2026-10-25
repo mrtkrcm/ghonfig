@@ -39,6 +39,8 @@ enum Cmd {
     Fonts,
     /// List available themes
     Themes,
+    /// List the colour names accepted wherever a colour is valid
+    Colors,
     /// Open the config in $EDITOR, then validate it
     Edit,
     /// Drop the cached font/theme/schema queries
@@ -135,12 +137,24 @@ fn main() -> Result<()> {
             }
         }
 
-        Some(Cmd::Doc { key }) => match schema().and_then(|s| s.get(&key).map(|s| (s.default_display(), s.doc.clone()))) {
-            Some((default, doc)) => {
+        Some(Cmd::Doc { key }) => match schema()
+            .and_then(|s| s.get(&key).map(|s| (s.default_display(), s.doc.clone(), s.kind.clone())))
+        {
+            Some((default, doc, kind)) => {
                 println!("{key}\n");
                 if !default.is_empty() {
-                    println!("default: {default}\n");
+                    println!("default: {default}");
                 }
+                // What the key accepts, as Ghostty reported it — the part that
+                // otherwise means a trip to the website.
+                match kind {
+                    ghostty::Kind::Enum(v) => println!("accepts: {}", v.join(", ")),
+                    ghostty::Kind::Color => println!("accepts: #rrggbb or a colour name (see `ghonfig colors`)"),
+                    ghostty::Kind::Scalar => println!("accepts: a single value"),
+                    ghostty::Kind::Structured => println!("accepts: a compound value, see below"),
+                    ghostty::Kind::Text => println!("accepts: free text"),
+                }
+                println!();
                 println!("{doc}");
             }
             None => {
@@ -151,7 +165,7 @@ fn main() -> Result<()> {
 
         Some(Cmd::Fonts) => {
             for f in ghostty::require()?.fonts()? {
-                println!("{f}");
+                println!("{}\t{}", f.name, f.styles.join(", "));
             }
         }
 
@@ -161,14 +175,21 @@ fn main() -> Result<()> {
             }
         }
 
+        Some(Cmd::Colors) => {
+            for (name, hex) in ghostty::require()?.colors()? {
+                println!("{name}\t{hex}");
+            }
+        }
+
         Some(Cmd::Edit) => {
             let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
             let mut parts = editor.split_whitespace();
             let bin = parts.next().unwrap_or("vi");
-            std::process::Command::new(bin)
+            let status = std::process::Command::new(bin)
                 .args(parts)
                 .arg(&path)
                 .status()?;
+            anyhow::ensure!(status.success(), "editor exited with {status}");
             if let Some(g) = &gh {
                 match g.validate(&path) {
                     Ok(()) => println!("✓ config validates"),
